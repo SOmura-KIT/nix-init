@@ -1,68 +1,74 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
 	"log"
 	"os"
 	"strings"
 
 	"github.com/urfave/cli/v2"
-
-	"github.com/SOmura-KIT/nix-init/internal/lang"
-	"github.com/SOmura-KIT/nix-init/internal/lang/clang"
-	"github.com/SOmura-KIT/nix-init/internal/lang/deno"
-	"github.com/SOmura-KIT/nix-init/internal/lang/golang"
-	"github.com/SOmura-KIT/nix-init/internal/lang/latex"
-	"github.com/SOmura-KIT/nix-init/internal/lang/node"
-	"github.com/SOmura-KIT/nix-init/internal/lang/python"
 )
-
-type Template struct {
-	Name        string
-	BuildInputs []string
-}
 
 func main() {
 	app := cli.NewApp()
 	app.Name = "nix-init"
 	app.Usage = "Generate nix-shell init script"
-	app.Action = Generate
+	app.Commands = []*cli.Command{
+		{
+			Name:   "gen",
+			Action: generateNixShell,
+			Flags: []cli.Flag{
+				&cli.StringFlag{
+					Name:    "path",
+					Aliases: []string{"o"},
+					Usage:   "Place the output into `FILE`.",
+					Value:   "shell.nix",
+				},
+				&cli.StringFlag{
+					Name:    "name",
+					Aliases: []string{"n"},
+					Usage:   "Set the name of the nix-shell",
+					Value:   "Template",
+				},
+				&cli.BoolFlag{
+					Name:    "envrc",
+					Aliases: []string{"e"},
+					Usage:   "Generate .envrc file",
+				},
+				&cli.BoolFlag{
+					Name:    "force",
+					Aliases: []string{"f"},
+					Usage:   "Overwrite existing files",
+				},
+				// TODO: implement this
+				&cli.BoolFlag{
+					Name:    "interactive",
+					Aliases: []string{"i"},
+					Usage:   "Ask for confirmation before overwriting",
+				},
+				&cli.BoolFlag{
+					Name:    "pretend",
+					Aliases: []string{"p"},
+					Usage:   "Print the generated script to stdout",
+				},
+			},
+		},
+		{
+			Name:   "list",
+			Action: listTemplates,
+		},
+		{
+			Name:   "config-file",
+			Action: configFile,
+		},
+	}
 	app.Flags = []cli.Flag{
 		&cli.StringFlag{
-			Name:    "path",
-			Aliases: []string{"o"},
-			Usage:   "Place the output into `FILE`.",
-			Value:   "shell.nix",
-		},
-		&cli.StringFlag{
-			Name:    "name",
-			Aliases: []string{"n"},
-			Usage:   "Set the name of the nix-shell",
-			Value:   "Template",
-		},
-		&cli.BoolFlag{
-			Name:    "envrc",
-			Aliases: []string{"e"},
-			Usage:   "Generate .envrc file",
-		},
-		&cli.BoolFlag{
-			Name:    "force",
-			Aliases: []string{"f"},
-			Usage:   "Overwrite existing files",
-		},
-		&cli.BoolFlag{
-			Name:    "interactive",
-			Aliases: []string{"i"},
-			Usage:   "Ask for confirmation before overwriting",
-		},
-		&cli.BoolFlag{
-			Name:    "pretend",
-			Aliases: []string{"p"},
-			Usage:   "Print the generated script to stdout",
-		},
-		&cli.BoolFlag{
-			Name:  "dev-tools",
-			Usage: "Generate development tools",
+			Name:    "config",
+			Aliases: []string{"c"},
+			Usage:   "Path to the configuration file",
+			Value:   fmt.Sprintf("%s/.config/nix-init/config.json", os.Getenv("HOME")),
 		},
 	}
 	err := app.Run(os.Args)
@@ -72,46 +78,74 @@ func main() {
 	}
 }
 
-func Generate(c *cli.Context) error {
-	template := Template{Name: c.String("name")}
+// generate shell.nix file
+func generateNixShell(c *cli.Context) error {
+	templates, err := loadTemplates(c.String("config"))
+	if err != nil {
+		return err
+	}
 
-	pkgs := InitPkgs()
+	// filter the templates to enable
+	if c.NArg() == 0 {
+		return fmt.Errorf("no template specified")
+	}
+	enables := []template{}
 	for _, arg := range c.Args().Slice() {
-		if pkg, ok := pkgs[arg]; ok {
-			template.BuildInputs = append(template.BuildInputs, pkg.Pkg()...)
-			if c.Bool("dev-tools") {
-				template.BuildInputs = append(template.BuildInputs, pkg.Tools()...)
+		isFound := false
+		for _, t := range templates {
+			if t.Key == arg {
+				enables = append(enables, t)
+				isFound = true
+				break
 			}
-		} else {
-			return cli.Exit("Unsupported package: "+arg, 1)
+		}
+		if !isFound {
+			return fmt.Errorf("template %s not found", arg)
 		}
 	}
 
-	text := GenText(template)
-	byteText := []byte(text)
+	text := makeText(enables, c.String("name"))
 
 	if c.Bool("pretend") {
 		fmt.Println(text)
 		return nil
 	}
 
-	shell_nix, err := os.Create(c.String("path"))
+	// write the nix-shell script to the file
+	path := c.String("path")
+	// check if the file already exists
+	if _, err := os.Stat(path); err == nil {
+		if !c.Bool("force") {
+			return fmt.Errorf("file %s already exists", path)
+		}
+	}
+
+	file, err := os.Create(path)
 	if err != nil {
 		return err
 	}
-	defer shell_nix.Close()
+	defer file.Close()
 
-	if _, err := shell_nix.Write(byteText); err != nil {
+	_, err = file.WriteString(text)
+	if err != nil {
 		return err
 	}
 
+	// generate the .envrc file
 	if c.Bool("envrc") {
+		if _, err := os.Stat(".envrc"); err == nil {
+			fmt.Println(".envrc already exists")
+			fmt.Println("Do $ echo \"use_nix\" >> .envrc to enable nix-shell")
+		}
+
 		envrc, err := os.Create(".envrc")
 		if err != nil {
 			return err
 		}
 		defer envrc.Close()
-		if _, err := envrc.Write([]byte("use_nix")); err != nil {
+
+		_, err = envrc.WriteString("use_nix")
+		if err != nil {
 			return err
 		}
 	}
@@ -119,32 +153,73 @@ func Generate(c *cli.Context) error {
 	return nil
 }
 
-func InitPkgs() map[string]lang.Languager {
-	return map[string]lang.Languager{
-		"clang":  clang.New(),
-		"deno":   deno.New(),
-		"golang": golang.New(),
-		"latex":  latex.New(),
-		"node":   node.New(),
-		"python": python.New(),
-	}
-}
-
-func GenText(template Template) string {
+// generate the nix-shell script from the templates
+func makeText(templates []template, name string) string {
 	lines := []string{
-		"# Generated by nix-init",
 		"{ pkgs ? import <nixpkgs> {} }:",
 		"",
 		"pkgs.mkShell {",
-		"  name = \"" + template.Name + "\";",
-		"",
+		"  name = \"" + name + "\";",
 		"  buildInputs = with pkgs; [",
 	}
-	for _, input := range template.BuildInputs {
-		lines = append(lines, "    "+input)
+
+	for _, t := range templates {
+		lines = append(lines, "    # "+t.Key)
+		for _, p := range t.Pkgs {
+			lines = append(lines, "    "+p)
+		}
 	}
+
 	lines = append(lines, "  ];")
 	lines = append(lines, "}")
 
 	return strings.Join(lines, "\n")
+}
+
+// load the configuration file and list the available templates
+func listTemplates(c *cli.Context) error {
+	templates, err := loadTemplates(c.String("config"))
+	if err != nil {
+		return err
+	}
+
+	for _, t := range templates {
+		fmt.Printf("%s:\n", t.Key)
+		for _, p := range t.Pkgs {
+			fmt.Printf("  - %s\n", p)
+		}
+	}
+
+	return nil
+}
+
+type template struct {
+	Key  string   `json:"key"`
+	Pkgs []string `json:"pkgs"`
+}
+
+// load the configuration file
+func loadTemplates(pathToConfig string) ([]template, error) {
+	// open the configuration file
+	config, err := os.Open(pathToConfig)
+	if err != nil {
+		return nil, err
+	}
+	defer config.Close()
+
+	// decode the configuration file
+	var templates []template
+	decoder := json.NewDecoder(config)
+	err = decoder.Decode(&templates)
+	if err != nil {
+		return nil, err
+	}
+
+	return templates, nil
+}
+
+// print the path to the configuration file
+func configFile(c *cli.Context) error {
+	fmt.Println("~/.config/nix-init/config.json")
+	return nil
 }
